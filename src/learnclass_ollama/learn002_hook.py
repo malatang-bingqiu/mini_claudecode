@@ -1,4 +1,3 @@
-# main.py
 import os
 import subprocess
 from pathlib import Path
@@ -7,9 +6,15 @@ from config import OLLAMA_MODEL
 
 WORKDIR = Path.cwd()
 
+def safe_path(p: str) -> Path:
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"路径逃逸出工作区：{p}")
+    return path
+
 def run_read(path: str, limit: int | None = None) -> str:
     try:
-        lines = (WORKDIR / path).resolve().read_text().splitlines()
+        lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} 行更多内容）"]
         return "\n".join(lines)
@@ -19,7 +24,7 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 def run_write(path: str, content: str) -> str:
     try:
-        file_path = (WORKDIR / path).resolve()
+        file_path = safe_path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content)
         return f"已写入 {len(content)} 字节到 {path}"
@@ -29,7 +34,7 @@ def run_write(path: str, content: str) -> str:
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
-        file_path = (WORKDIR / path).resolve()
+        file_path = safe_path(path)
         text = file_path.read_text()
         if old_text not in text:
             return f"错误：在文件中未找到目标文本：{path}"
@@ -37,7 +42,6 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"已编辑 {path}"
     except Exception as e:
         return f"错误：{e}"
-
 
 def run_glob(pattern: str) -> str:
     import glob as g
@@ -110,69 +114,85 @@ TOOL_HANDLERS = {
     "edit_file": run_edit, "glob": run_glob,
 }
 
-# 关卡 1：硬性拒绝列表 — 始终禁止
-DENY_LIST = [
-    # Linux 风格
-    "rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda",
-    # Windows 风格
-    "rmdir /s", "rd /s", "del /f", "del /s", "format ",
-    "Remove-Item -Recurse", "Remove-Item -Force",
-    # 通用高危路径
-    "C:\\Windows", "D:\\Users", "C:\\Users", "System32",
-]
+# ═══════════════════════════════════════════════════════════
+#  新增于 s04: 钩子系统（s03 权限逻辑现在通过钩子实现）
+# ═══════════════════════════════════════════════════════════
 
-def check_deny_list(command: str) -> str | None:
-    for pattern in DENY_LIST:
-        if pattern in command:
-            return f"已拦截：'{pattern}' 位于拒绝列表中"
+HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
+
+def register_hook(event: str, callback):
+    HOOKS[event].append(callback)
+
+def trigger_hooks(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:  # 教学快捷方式：拦截这个工具调用
+            return result
     return None
 
+## s03 权限检查逻辑，现在封装成钩子
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
+DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
-# 关卡 2：规则匹配 — 根据上下文检查
-PERMISSION_RULES = [
-    {"tools": ["read_file", "write_file", "edit_file"],
-     "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
-     "message": "写入工作区外部路径"},
-    {"tools": ["bash"],
-     "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "rmdir", "rd ", "del ", "remove-item", "> /etc/", "chmod 777", "format"]),
-     "message": "可能具有破坏性的命令"},
-]
+def permission_hook(block):
+    """PreToolUse：这里承载从 s03 迁移过来的 check_permission() 逻辑。"""
+    if block.name == "bash":
+        for pattern in DENY_LIST:
+            if pattern in block.arguments.get("command", ""):
+                print(f"\n\033[31m⛔ 已拦截：'{pattern}'\033[0m")
+                return "被拒绝列表拒绝授权"
+        for kw in DESTRUCTIVE:
+            if kw in block.arguments.get("command", ""):
+                print(f"\n\033[33m⚠  可能具有破坏性的命令\033[0m")
+                print(f"   工具：{block.name}({block.arguments})")
+                choice = input("   是否允许？[y/N] ").strip().lower()
+                if choice not in ("y", "yes"):
+                    return "用户拒绝授权"
+    if block.name in ("read_file", "write_file", "edit_file"):
+        path = block.arguments.get("path", "")
+        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            print(f"\n\033[33m⚠  访问工作区外部路径\033[0m")
+            print(f"   工具：{block.name}({block.arguments})")
+            choice = input("   是否允许？[y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "用户拒绝授权"
+    return None
 
-def check_rules(tool_name: str, args: dict) -> str | None:
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
-    return
+def log_hook(block):
+    """PreToolUse：记录每一次工具调用。"""
+    args = block.arguments or {}
+    preview_parts = []
+    for k, v in list(args.items())[:2]:
+        v_str = str(v)
+        if len(v_str) > 40:
+            v_str = v_str[:40] + "..."
+        preview_parts.append(f"{k}={v_str!r}")
+    preview = ", ".join(preview_parts)
+    print(f"\033[90m[钩子] {block.name}({preview})\033[0m")
+    return None
 
+def large_output_hook(block, output):
+    """PostToolUse：对大型输出给出提醒。"""
+    if len(str(output)) > 100000:
+        print(f"\033[33m[钩子] ⚠ 来自以下工具的大输出：{block.name}: {len(str(output))} 个字符\033[0m")
+    return None
 
-# 关卡 3：用户审批 — 规则命中后等待确认
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n\033[33m⚠  {reason}\033[0m")
-    print(f"   工具：{tool_name}({args})")
-    choice = input("   是否允许？[y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
+# 用户提交提示词钩子：在用户输入到达 LLM 前记录它
+def context_inject_hook(query: str):
+    print(f"\033[90m[钩子] UserPromptSubmit: 工作目录：{WORKDIR}\033[0m")
+    return None
 
+# 停止钩子：在循环即将退出时打印摘要
+def summary_hook(messages: list):
+    tool_count = sum(1 for m in messages if m.get("role") == "tool")
+    print(f"\033[90m[钩子] Stop：会话使用了 {tool_count} 次工具调用\033[0m")
+    return None
 
-# 流水线：三道关卡串联
-
-def check_permission(tool_name: str, args: dict) -> bool:
-    # 关卡 1：硬性拒绝列表
-    if tool_name == "bash":
-        reason = check_deny_list(args.get("command", ""))
-        if reason:
-            print(f"\n\033[31m⛔ {reason}\033[0m")
-            return False
-
-    # 关卡 2：规则匹配
-    reason = check_rules(tool_name, args)
-    if reason:
-        # 关卡 3：用户审批
-        decision = ask_user(tool_name, args, reason)
-        if decision == "deny":
-            return False
-
-    return True
-
+register_hook("UserPromptSubmit", context_inject_hook)
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
+register_hook("PostToolUse", large_output_hook)
+register_hook("Stop", summary_hook)
 
 def agent_loop(user_input: str, messages: list) -> str:
     """跑一轮完整的工具调用循环，返回最终回复"""
@@ -188,37 +208,33 @@ def agent_loop(user_input: str, messages: list) -> str:
 
         # 没有工具调用 → 说明模型给出最终答案
         if not response.message.tool_calls:
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({
+                    "role": "assistant",
+                    "content": force})
+                continue
             return response.message.content
-       
 
         # 处理工具调用
         # 判断消息中是否有tool_calls，以判断工具是否被调用
-        print(f"\n调用工具前：\n{response.message}\n{'***'*10}")
+        # print(f"\n调用工具前：\n{response.message}\n{'***'*10}")
 
         # 有工具调用 → 逐个执行
         for tc in response.message.tool_calls:
             name = tc.function.name
             args = tc.function.arguments or {}
-            print(f"  [调用工具] {name}({args})")
+            # print(f"  [调用工具] {name}({args})")
 
-            # ── 三道权限关卡 ──
-            if not check_permission(name, args):
-                result = "权限被拒绝。"
-                print(f"  [已拒绝] {name}")
-            else:
-                handler = TOOL_HANDLERS.get(name)
-                if handler is None:
-                    result = f"未知工具：{name}"
-                else:
-                    result = handler(**args)
-                print(f"  [工具返回] {result}")
-
-            # 每个工具结果单独作为一条 tool 消息追加
-            messages.append({
-                "role": "tool",
-                "tool_name": name,
-                "content": str(result),
-            })
+            # s04 变化： Hook 替代硬编码的 check_permission()
+            blocked = trigger_hooks("PreToolUse", tc.function)
+            if blocked:
+                messages.append({"role": "tool", "tool_name": name, "content": str(blocked),})
+                continue
+            handler = TOOL_HANDLERS.get(name)
+            result = handler(**args) if handler is not None else f"未知工具：{name}"
+            trigger_hooks("PostToolUse", tc.function, result)  # s04: 后置钩子
+            messages.append({"role": "tool", "tool_name": name, "content": str(result),})
         print("---"*10)
 
 
@@ -233,9 +249,10 @@ def main():
         user_input = input("你: ").strip()
         if user_input.lower() in ("exit", "quit"):
             break
+
         if not user_input:
             continue
-
+        trigger_hooks("UserPromptSubmit", user_input)
         reply = agent_loop(user_input, messages)
         print(f"\n助手: {reply}\n")
         print("==="*10)
