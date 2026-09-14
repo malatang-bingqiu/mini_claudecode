@@ -22,6 +22,7 @@ env/
 # 环境变量 / 密钥（重要！）
 .env
 *.env
+.python-version
 config_local.py
 config.py
 
@@ -38,3 +39,6 @@ debug.log
 debugTrain.py
 prompt.txt
 test*
+
+# 外部skill
+skills
