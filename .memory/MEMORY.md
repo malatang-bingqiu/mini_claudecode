@@ -1,0 +1,1 @@
+- [user-work-profile](user-work-profile.md) — 用户工作现状：算法测试工程师、新部门负责人、杭州、想离职，2026-07 存档
