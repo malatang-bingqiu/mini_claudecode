@@ -38,8 +38,14 @@ Thumbs.db
 debug.log
 debugTrain.py
 prompt.txt
-test*
 
 # 外部skill
 skills
 .memory
+
+# 课程实验产生的运行时数据（任务系统 / cron 持久化）
+.tasks/
+.scheduled_tasks.json
+
+# 课件代码
+learn_code
