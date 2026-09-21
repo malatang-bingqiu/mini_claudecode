@@ -1,5 +1,5 @@
 [project]
-name = "learn001"
+name = "myc"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -16,8 +16,9 @@ dependencies = [
     "winsdk>=1.0.0b10",
 ]
 
-# [project.scripts]
-# learn001 = "learn001:main"
+[tool.uv.build-backend]
+module-name = "mycc"
+module-root = "src"
 
 [build-system]
 requires = ["uv_build>=0.12.7,<0.13.0"]
